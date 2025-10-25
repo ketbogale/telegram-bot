@@ -2,6 +2,7 @@ import os
 from typing import Dict
 from dotenv import load_dotenv
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -18,20 +19,40 @@ user_sessions: Dict[int, Dict[str, str]] = {}
 
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CA_BUNDLE_PATH = os.getenv("CA_BUNDLE_PATH")
+
+# Externalized portal configuration (no hardcoded defaults)
+PORTAL_BASE_URL = (os.getenv("PORTAL_BASE_URL") or "").rstrip("/")
+PORTAL_LOGIN_PATH = os.getenv("PORTAL_LOGIN_PATH") or ""
+PORTAL_POINTS_PATH = os.getenv("PORTAL_POINTS_PATH") or ""
+PORTAL_USERNAME_FIELD = os.getenv("PORTAL_USERNAME_FIELD") or ""
+PORTAL_PASSWORD_FIELD = os.getenv("PORTAL_PASSWORD_FIELD") or ""
+PORTAL_CSRF_FIELD = os.getenv("PORTAL_CSRF_FIELD") or ""
+VERIFY_SSL_ENV = os.getenv("VERIFY_SSL", "false").strip().lower()
+VERIFY_SSL = VERIFY_SSL_ENV in ("1", "true", "yes", "on")
+
+if not (PORTAL_BASE_URL and PORTAL_LOGIN_PATH and PORTAL_POINTS_PATH and PORTAL_USERNAME_FIELD and PORTAL_PASSWORD_FIELD and PORTAL_CSRF_FIELD):
+    raise RuntimeError(
+        "Missing portal configuration. Set PORTAL_BASE_URL, PORTAL_LOGIN_PATH, PORTAL_POINTS_PATH, "
+        "PORTAL_USERNAME_FIELD, PORTAL_PASSWORD_FIELD, PORTAL_CSRF_FIELD in .env"
+    )
 
 portal_config = PortalConfig(
-    base_url="https://portal.ju.edu.et",
-    login_path="/login",           # confirmed by form action
-    points_path="/student/academic/grade", # provided
-    username_field="username",     # TODO: verify
-    password_field="password",     # TODO: verify
-    csrf_field="_token",
+    base_url=PORTAL_BASE_URL,
+    login_path=PORTAL_LOGIN_PATH,
+    points_path=PORTAL_POINTS_PATH,
+    username_field=PORTAL_USERNAME_FIELD,
+    password_field=PORTAL_PASSWORD_FIELD,
+    csrf_field=PORTAL_CSRF_FIELD,
+    verify_ssl=VERIFY_SSL,
+    ca_bundle_path=CA_BUNDLE_PATH,
 )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Welcome to the JU Points Bot.\n\nUse /login to securely check your points.\nYour credentials are not stored; they are used only for this session."
+        "Welcome to the JU Points Bot."
     )
+    await help_cmd(update, context)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -42,12 +63,18 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Clear any previous session and start fresh
+    user_sessions.pop(update.effective_chat.id, None)
     await update.message.reply_text("Please enter your username:")
     return ASK_USERNAME
 
 async def ask_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user_sessions[chat_id] = {"username": update.message.text}
+    username = (update.message.text or "").strip()
+    if not username:
+        await update.message.reply_text("Username cannot be empty. Please enter your username:")
+        return ASK_USERNAME
+    user_sessions[chat_id] = {"username": username}
     await update.message.reply_text("Please enter your password:")
     return ASK_PASSWORD
 
@@ -58,9 +85,13 @@ async def ask_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     username = user_sessions[chat_id]["username"]
-    password = update.message.text
+    password = (update.message.text or "").strip()
+    if not password:
+        await update.message.reply_text("Password cannot be empty. Please enter your password:")
+        return ASK_PASSWORD
 
-    await update.message.reply_text("Logging in to JU portal...")
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    await update.message.reply_text("Logging in to the portal...")
 
     client = PortalClient(config=portal_config)
     try:
@@ -71,10 +102,11 @@ async def ask_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if not ok:
-        await update.message.reply_text("Invalid credentials or portal rejected the login. Please try /login again.")
+        await update.message.reply_text("Invalid credentials or portal rejected the login. Use /login to try again.")
         user_sessions.pop(chat_id, None)
         return ConversationHandler.END
 
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     await update.message.reply_text("Login successful. Fetching your points...")
     try:
         points = client.fetch_points()
@@ -108,6 +140,13 @@ async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Please use /login to check your grades or /help to see commands."
     )
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if hasattr(context, "error") and update and isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text("An error occurred. Please try again later.")
+    except Exception:
+        pass
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
@@ -145,8 +184,9 @@ def main():
     # Generic handlers after conversation so they don't interfere with flows
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text))
+    app.add_error_handler(on_error)
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
